@@ -1,5 +1,5 @@
 [mattermost]
-base_url = "https://chat.canonical.com"
+base_url = "https://chat.xxx.com"
 personal_token = "INSERT_YOUR_MATTERMOST_PERSONAL_ACCESS_TOKEN_HERE"
 lookback_hours = 24
 request_timeout_seconds = 30
