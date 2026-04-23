@@ -1,0 +1,21 @@
+[mattermost]
+base_url = "https://chat.canonical.com"
+personal_token = "INSERT_YOUR_MATTERMOST_PERSONAL_ACCESS_TOKEN_HERE"
+lookback_hours = 24
+request_timeout_seconds = 30
+per_page = 200
+
+[gmail]
+client_secret_path = "~/.config/mattermost-digest/client_secret.json"
+token_cache_path = "~/.config/mattermost-digest/tokencache.json"
+from_email = "myaddress@gmail.com"
+to_email = "myaddress@gmail.com"
+email_subject = "Mattermost Digest"
+
+[output]
+markdown_path = "~/.local/state/mattermost-digest/latest-digest.md"
+include_empty_channels = false
+max_posts_per_channel = 500
+
+[logging]
+level = "info"
