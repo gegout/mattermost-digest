@@ -1,16 +1,36 @@
 # Mattermost Digest
 
-`mattermost-digest` is a production-quality Rust CLI application that connects to a Mattermost server, fetches messages from your channels over a configurable time window, compiles them into a markdown digest, and sends it to you via email using the Gmail API (OAuth Installed-App flow).
+`mattermost-digest` is a production-quality Rust CLI application that helps you reclaim your time from endless chat logs. It connects to your Mattermost server, fetches messages from your channels over a configurable time window (e.g., the last 24 hours), intelligently summarizes them using the Gemini AI, and sends a beautifully formatted HTML report directly to your email via the Gmail API.
 
-It operates completely transparently to the Mattermost server. It does **not** change any channel's "unread" or "viewed" status.
+## Motivation
+
+In highly active remote teams, returning from a day off or just waking up to hundreds of unread Mattermost messages across dozens of channels can be overwhelming. Reading through everything takes too much time, but ignoring it risks missing critical information. 
+
+**The goal of this application is to:**
+1. **Save Time:** Provide an AI-powered "Executive Summary" at the top of your email that highlights exactly what you need to know, grouped into what is important to you, what is important for the team, and what is just FYI.
+2. **Be Unobtrusive:** Operate completely transparently. The application strictly relies on read-only endpoints and intentionally does **not** change any channel's "unread" or "viewed" status. You can read the AI digest and still have your original unread badges intact in your Mattermost client if you want to respond later.
+3. **Be Beautiful:** Deliver a polished, styled HTML email directly to your inbox that is easy to read on both desktop and mobile.
+
+---
+
+## Features
+- 🚀 **Fast & Concurrent:** Written in Rust for maximum performance and low memory footprint.
+- 🤖 **AI Summarization:** Uses Google Gemini to generate a smart, prioritized executive summary.
+- 📧 **Gmail Integration:** Sends emails from your own account using OAuth 2.0 (Installed-App flow).
+- 🎨 **HTML Formatting:** Converts Markdown chat logs into a highly readable, styled HTML newsletter.
+- 📊 **Visual Feedback:** Displays a real-time progress bar while fetching messages.
+- ⚙️ **Flexible CLI:** Easily override default configurations directly from the command line.
+
+---
 
 ## Prerequisites
 - **Rust toolchain** (1.70+ recommended).
 - A **Mattermost Personal Access Token**.
 - A **Google Cloud Project** with the Gmail API enabled and an OAuth Installed-App client secret.
+- A **Google Gemini API Key**.
 
 ## Google OAuth Setup
-To send emails via Gmail API, you need Google OAuth credentials:
+To send emails via the Gmail API, you need Google OAuth credentials:
 1. Go to the [Google Cloud Console](https://console.cloud.google.com/).
 2. Create a new project or select an existing one.
 3. Enable the **Gmail API** for the project.
@@ -18,7 +38,7 @@ To send emails via Gmail API, you need Google OAuth credentials:
 5. Go to **Credentials**, click **Create Credentials** -> **OAuth client ID**.
 6. Select **Desktop app** (Installed App) as the application type.
 7. Download the `client_secret.json` file.
-8. Place the `client_secret.json` file in `~/.config/mattermost-digest/client_secret.json` (or any path you prefer, and configure it in `config.toml`).
+8. Place the `client_secret.json` file in `~/.config/mattermost-digest/` (or any path you prefer, and configure it in `config.toml`).
 
 ## Mattermost Setup
 To fetch messages from Mattermost, you need a Personal Access Token:
@@ -35,58 +55,73 @@ mkdir -p ~/.config/mattermost-digest
 cp config.example.toml ~/.config/mattermost-digest/config.toml
 ```
 
+Populate it with your Mattermost token, your Gmail secret path, your emails, and your Gemini API key.
+
 ## Build Instructions
-Build the project using standard Cargo commands:
+Build the highly-optimized production version using standard Cargo commands:
 ```bash
 cargo build --release
 ```
-The executable will be located at `target/release/mattermost-digest`.
-
-## Run Instructions
-
-### 1. Test Mattermost
+The executable will be located at `target/release/mattermost-digest`. You can copy it to your local bin folder to run it from anywhere:
 ```bash
-cargo run -- test mattermost
+cp target/release/mattermost-digest ~/.local/bin/
 ```
-This tests your connection to the Mattermost server using your personal token.
+
+---
+
+## Run Instructions & CLI Usage
+
+The application features an intuitive CLI to manage authentication, test connections, and execute the digest pipeline.
+
+### 1. Test Connections
+Before running the full pipeline, verify that all external services are configured correctly:
+```bash
+mattermost-digest test mattermost
+mattermost-digest test gmail
+mattermost-digest test gemini
+```
 
 ### 2. Authenticate Gmail
 ```bash
-cargo run -- auth gmail
+mattermost-digest auth gmail
 ```
-This will open your default web browser. Follow the prompts to authenticate with your Google account. It will store the OAuth token cache in `~/.config/mattermost-digest/tokencache.json`. Future runs will use this cached token silently.
+This will open your default web browser. Follow the prompts to authenticate with your Google account. It will securely store the OAuth token cache in `~/.config/mattermost-digest/tokencache.json`. Future runs will use this cached token silently.
 
 ### 3. Dry-Run Digest
 ```bash
-cargo run -- run --dry-run
+mattermost-digest run --dry-run
 ```
-This will fetch all new messages, generate the markdown file at `~/.local/state/mattermost-digest/latest-digest.md`, and exit without sending the email.
+This will fetch all new messages and generate the markdown and HTML digest, but it will **exit without sending the email**. This is great for testing your configuration locally.
 
-### 4. Run Digest
+### 4. Run the Full Pipeline
 ```bash
-cargo run -- run
+mattermost-digest run
 ```
-This fetches messages, creates the markdown file, and sends the digest email to your configured address.
+This executes the entire workflow:
+1. Fetches all channels and messages from the last 24 hours (or configured window).
+2. Sends the raw logs to Gemini for intelligent summarization.
+3. Compiles the AI summary and raw logs into a styled HTML document.
+4. Uses Gmail OAuth to email the report to your configured inbox.
 
-## Limitations and Future Improvements
-- Only the past X hours of messages are fetched based on configuration.
-- Channel metadata (like Team name) is currently not fully fetched unless needed, prioritizing simple display names.
-- Attachments and reactions on posts are currently ignored in the digest.
-- In a future version, an HTML alternative body could be sent alongside the text body, utilizing a Markdown to HTML compiler.
+### 5. Override Configuration on the Fly
+You can temporarily override settings in your `config.toml` directly from the CLI:
+```bash
+mattermost-digest run --lookback-hours 12 --my-username "cgegout" --max-posts-per-channel 100
+```
+Run `mattermost-digest run --help` to see all available override options.
+
+---
 
 ## Security Notes
-- **Never commit your `config.toml`**, `client_secret.json`, or `tokencache.json`.
-- Restrict permissions on your config files (e.g. `chmod 600 ~/.config/mattermost-digest/config.toml`).
-- Use tokens with the minimal required permissions on both Google and Mattermost if possible.
+- **Never commit your `config.toml`**, `client_secret.json`, or `tokencache.json` to version control.
+- Restrict permissions on your config files (e.g., `chmod 600 ~/.config/mattermost-digest/config.toml`).
+- Use tokens with the minimal required permissions on Google, Gemini, and Mattermost.
 
 ## Mattermost REST APIs Used
-The application intentionally uses only a read-only subset of the Mattermost API:
+The application intentionally uses only a strictly read-only subset of the Mattermost API:
 - `GET /api/v4/users/me` (To validate the token)
 - `GET /api/v4/users/me/channels` (To discover channels)
 - `GET /api/v4/channels/{channel_id}/posts?since={unix_ms}&page={page}&per_page={per_page}` (To fetch recent posts)
 - `POST /api/v4/users/ids` (To resolve author user IDs)
 
-## Mattermost REST APIs Intentionally Not Used
-To satisfy the strict constraint that the tool **must not mark any messages as read or viewed**, these endpoints are intentionally **never called**:
-- *Any* view-marking endpoint under channel views (`POST /api/v4/channels/{channel_id}/view`).
-- *Any* unread-state retrieval (`GET /api/v4/users/{user_id}/channels/{channel_id}/posts/unread` or `GET /api/v4/users/{user_id}/channels/{channel_id}/unread`).
+**To satisfy the strict constraint that the tool must not mark any messages as read or viewed**, view-marking endpoints under channel views and unread-state retrievals are intentionally **never called**.
