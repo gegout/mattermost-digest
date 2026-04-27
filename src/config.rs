@@ -19,6 +19,9 @@ pub struct Config {
     pub output: OutputConfig,
     /// Configuration for application logging levels.
     pub logging: LoggingConfig,
+    /// Configuration for Telegram Bot mode.
+    #[serde(default)]
+    pub telegram: Option<TelegramConfig>,
 }
 
 /// Settings specific to the Mattermost API.
@@ -99,6 +102,38 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
+/// Settings specific to the Telegram bot integration.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TelegramConfig {
+    /// Telegram Bot token.
+    pub bot_token: String,
+    /// List of Telegram user IDs allowed to interact with the bot.
+    pub allowed_user_ids: Vec<u64>,
+    /// How often to poll Telegram for new updates in seconds.
+    #[serde(default = "default_telegram_poll_interval")]
+    pub poll_interval_seconds: u64,
+    /// Timeout for HTTP requests to Telegram.
+    #[serde(default = "default_telegram_request_timeout")]
+    pub request_timeout_seconds: u64,
+    /// Formatting mode for Telegram messages (e.g. HTML).
+    #[serde(default = "default_telegram_parse_mode")]
+    pub parse_mode: String,
+    /// Settings related to reboot commands.
+    #[serde(default)]
+    pub reboot: TelegramRebootConfig,
+}
+
+/// Settings for Telegram reboot commands.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct TelegramRebootConfig {
+    /// Whether to require confirmation before rebooting.
+    #[serde(default = "default_true")]
+    pub require_confirmation: bool,
+    /// Timeout for receiving confirmation.
+    #[serde(default = "default_telegram_confirmation_timeout")]
+    pub confirmation_timeout_seconds: u64,
+}
+
 // Default providers for serde deserialization
 fn default_base_url() -> String { "https://chat.canonical.com".to_string() }
 fn default_my_username() -> String { "cgegout".to_string() }
@@ -113,6 +148,11 @@ fn default_email_subject() -> String { "Mattermost Digest".to_string() }
 fn default_false() -> bool { false }
 fn default_max_posts() -> u32 { 500 }
 fn default_log_level() -> String { "info".to_string() }
+fn default_telegram_poll_interval() -> u64 { 3 }
+fn default_telegram_request_timeout() -> u64 { 30 }
+fn default_telegram_parse_mode() -> String { "HTML".to_string() }
+fn default_true() -> bool { true }
+fn default_telegram_confirmation_timeout() -> u64 { 120 }
 
 impl Config {
     /// Loads the configuration from the standardized config path.

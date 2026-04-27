@@ -9,6 +9,10 @@ pub mod gemini;
 pub mod gmail;
 pub mod mattermost;
 pub mod models;
+pub mod telegram;
+pub mod telegram_commands;
+pub mod telegram_format;
+pub mod system_status;
 
 use chrono::Utc;
 use clap::Parser;
@@ -183,6 +187,10 @@ async fn run() -> Result<(), AppError> {
             safe_config.gemini.api_key = "********".to_string();
             let toml_string = toml::to_string_pretty(&safe_config).unwrap();
             println!("{}", toml_string);
+        }
+        
+        Commands::Bot => {
+            crate::telegram::run_bot(config).await;
         }
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "mattermost-digest"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [dependencies]
@@ -24,3 +24,4 @@ tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 yup-oauth2 = { version = "12", features = ["hyper-rustls"] }
+sysinfo = "0.30"

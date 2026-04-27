@@ -51,6 +51,9 @@ pub enum Commands {
     
     /// Print the current configuration (with sensitive fields redacted).
     PrintConfig,
+
+    /// Start the interactive Telegram bot mode.
+    Bot,
 }
 
 /// Services that support explicit authentication commands.

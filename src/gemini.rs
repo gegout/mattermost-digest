@@ -281,6 +281,28 @@ async fn call_gemini_text(config: &Config, prompt: &str) -> Result<String, AppEr
     }
 }
 
+/// Main entrypoint for custom summarization: generates a summary without modifying history.
+pub async fn summarize_custom_digest(
+    config: &Config, 
+    digest_markdown: &str,
+    custom_context: Option<String>,
+    custom_history: Option<String>,
+) -> Result<String, AppError> {
+    tracing::info!("Initiating custom Gemini summarization pipeline...");
+
+    let context_text = custom_context.unwrap_or_else(load_context_text);
+    let history_text = custom_history.unwrap_or_else(load_history_text);
+
+    let summary_prompt = build_summary_prompt(config, digest_markdown, &context_text, &history_text);
+
+    let summary_result = call_gemini_text(config, &summary_prompt).await?;
+    tracing::info!("Successfully received custom summary from Gemini API.");
+
+    // Note: intentionally skipping history generation to avoid contaminating the main history flow.
+
+    Ok(summary_result)
+}
+
 /// Main entrypoint for summarization: generates a summary and advances the rolling history.
 pub async fn summarize_digest(config: &Config, digest_markdown: &str) -> Result<String, AppError> {
     tracing::info!(
