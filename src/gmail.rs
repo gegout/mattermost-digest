@@ -11,6 +11,8 @@ use google_gmail1::hyper_util;
 use crate::config::GmailConfig;
 use crate::error::AppError;
 
+/// Initializes the Gmail API client using an OAuth installed-app flow.
+/// Will prompt the user to log in via a browser if the token cache is missing or invalid.
 pub async fn get_gmail_client(
     config: &GmailConfig,
 ) -> Result<Gmail<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>>, AppError> {
@@ -22,12 +24,14 @@ pub async fn get_gmail_client(
         )));
     }
 
+    // Read the OAuth client secret from the provided JSON file.
     let secret = read_application_secret(&secret_path)
         .await
         .map_err(|e| AppError::Gmail(format!("Failed to read client secret: {}", e)))?;
 
     let token_cache_path = crate::config::expand_tilde(&config.token_cache_path);
 
+    // Build the authenticator, persisting tokens to disk so subsequent runs are headless.
     let auth = InstalledFlowAuthenticator::builder(
         secret,
         InstalledFlowReturnMethod::HTTPRedirect,
@@ -51,6 +55,7 @@ pub async fn get_gmail_client(
     Ok(Gmail::new(client, auth))
 }
 
+/// Sends the HTML-formatted digest as an email using the Gmail API.
 pub async fn send_digest_email(
     config: &GmailConfig,
     html_content: &str,
@@ -61,6 +66,7 @@ pub async fn send_digest_email(
     let from = &config.from_email;
     let subject = &config.email_subject;
 
+    // Construct the raw RFC 822 MIME email payload.
     let mime_message = format!(
         "To: {}\r\nFrom: {}\r\nSubject: {}\r\nContent-Type: text/html; charset=\"UTF-8\"\r\n\r\n{}",
         to, from, subject, html_content
@@ -78,11 +84,12 @@ pub async fn send_digest_email(
 
     tracing::info!("Digest email successfully sent!");
 
+    // If sending succeeded, try to apply the 'Mattermost' label to the newly sent message.
     if let Some(msg_id) = result.id {
         tracing::info!("Finding or creating 'Mattermost' label...");
         let mut label_id = None;
         
-        // List existing labels
+        // List existing labels to see if 'Mattermost' exists
         if let Ok((_, labels_resp)) = hub.users().labels_list("me").doit().await {
             if let Some(labels) = labels_resp.labels {
                 for label in labels {
@@ -94,7 +101,7 @@ pub async fn send_digest_email(
             }
         }
 
-        // Create label if it doesn't exist
+        // Create the label if it doesn't exist
         if label_id.is_none() {
             tracing::info!("Label 'Mattermost' not found, creating it...");
             let new_label = Label {
@@ -125,11 +132,11 @@ pub async fn send_digest_email(
     Ok(())
 }
 
+/// Tests the Gmail authentication flow and token validity.
 pub async fn test_auth(config: &GmailConfig) -> Result<(), AppError> {
     let hub = get_gmail_client(config).await?;
     
     // Test the token by fetching profile
-    // Note: get_profile does not support media upload, so it has a .doit() wrapper in v7.
     let _ = hub
         .users()
         .get_profile("me")

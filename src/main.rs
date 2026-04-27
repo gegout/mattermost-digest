@@ -20,9 +20,13 @@ use crate::config::Config;
 use crate::error::AppError;
 use crate::mattermost::{MattermostApi, MattermostClient};
 
+/// Application entrypoint
 #[tokio::main]
 async fn main() {
+    // Install the rustls crypto provider to support HTTPS requests via reqwest
     let _ = rustls::crypto::ring::default_provider().install_default();
+    
+    // Execute the main run logic and catch any propagated AppErrors
     if let Err(e) = run().await {
         tracing::error!("Application error: {}", e);
         eprintln!("Error: {}", e);
@@ -30,6 +34,7 @@ async fn main() {
     }
 }
 
+/// Core execution flow orchestrating CLI parsing, API clients, and the digest logic.
 async fn run() -> Result<(), AppError> {
     // Attempt to load config early to get log level, if possible.
     // Otherwise fallback to "info".
@@ -37,15 +42,18 @@ async fn run() -> Result<(), AppError> {
         .map(|c| c.logging.level)
         .unwrap_or_else(|_| "info".to_string());
 
+    // Setup logging to a file in the current directory
     let file_appender = tracing_appender::rolling::never(".", "mattermost-digest.out");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     let env_filter = EnvFilter::new(&log_level);
     
+    // Setup standard output logging
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stdout)
         .with_filter(EnvFilter::new(&log_level));
         
+    // Combine file and stdout tracing subscribers
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
         .with_ansi(false)
@@ -56,12 +64,14 @@ async fn run() -> Result<(), AppError> {
         .with(file_layer)
         .try_init();
 
+    // Parse the CLI arguments
     let cli = Cli::parse();
     let mut config = Config::load()?;
 
+    // Route execution based on the chosen command
     match cli.command {
         Commands::Run { dry_run, lookback_hours, my_username, max_posts_per_channel } => {
-            // Apply CLI overrides if provided
+            // Apply CLI overrides to configuration if provided
             if let Some(h) = lookback_hours {
                 config.mattermost.lookback_hours = h;
                 tracing::info!("Overriding lookback_hours via CLI to {}", h);
@@ -75,20 +85,21 @@ async fn run() -> Result<(), AppError> {
                 tracing::info!("Overriding max_posts_per_channel via CLI to {}", m);
             }
 
-            // Initialize API clients
+            // Initialize Mattermost API client and fetch the latest messages
             let mm_client = MattermostClient::new(&config.mattermost)?;
             let now = Utc::now();
             let result = digest::generate_digest(&mm_client, &config, now).await?;
             
             let md_path = config::expand_tilde(&config.output.markdown_path);
             
-            // Ensure the directory for the output file exists
+            // Ensure the directory for the raw output file exists
             if let Some(parent) = md_path.parent() {
                 fs::create_dir_all(parent)?;
             }
             
             let mut final_markdown = result.markdown.clone();
             
+            // Generate a Gemini-powered executive summary if activity was found
             if result.has_messages {
                 tracing::info!("Summarizing digest with Gemini...");
                 match gemini::summarize_digest(&config, &result.markdown).await {
@@ -102,10 +113,11 @@ async fn run() -> Result<(), AppError> {
                 }
             }
             
+            // Write out the Markdown to disk
             fs::write(&md_path, &final_markdown)?;
             tracing::info!("Wrote markdown digest to {:?}", md_path);
 
-            // Convert the Markdown text into beautifully styled HTML using pulldown-cmark
+            // Convert the Markdown text into styled HTML using pulldown-cmark
             tracing::info!("Converting markdown to HTML for email...");
             let parser = pulldown_cmark::Parser::new(&final_markdown);
             let mut html_output = String::new();
@@ -125,6 +137,7 @@ async fn run() -> Result<(), AppError> {
                 html_output
             );
             
+            // Email dispatching rules
             if dry_run {
                 tracing::info!("Dry run enabled. Skipping email send.");
             } else if !result.has_messages {
@@ -137,6 +150,7 @@ async fn run() -> Result<(), AppError> {
                 tracing::info!("Email sent successfully.");
             }
         }
+        
         Commands::Auth { service } => match service {
             AuthCommand::Gmail => {
                 tracing::info!("Starting Gmail authentication flow...");
@@ -144,6 +158,7 @@ async fn run() -> Result<(), AppError> {
                 tracing::info!("Gmail authentication successful!");
             }
         },
+        
         Commands::Test { service } => match service {
             TestCommand::Mattermost => {
                 tracing::info!("Testing Mattermost connection...");
@@ -160,7 +175,9 @@ async fn run() -> Result<(), AppError> {
                 gemini::test_connection(&config).await?;
             }
         },
+        
         Commands::PrintConfig => {
+            // Clones the configuration structure and censors tokens/keys before logging it.
             let mut safe_config = config.clone();
             safe_config.mattermost.personal_token = "********".to_string();
             safe_config.gemini.api_key = "********".to_string();

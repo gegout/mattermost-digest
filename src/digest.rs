@@ -10,24 +10,32 @@ use crate::error::AppError;
 use crate::mattermost::MattermostApi;
 use crate::models::{Channel, Post, User};
 
+/// Encapsulates the output of a digest generation cycle.
 pub struct DigestResult {
+    /// The raw generated markdown string of all chat activities.
     pub markdown: String,
+    /// Boolean indicating whether any new messages were actually found.
     pub has_messages: bool,
 }
 
+/// Core application logic that scans Mattermost channels and formats the activity log.
 pub async fn generate_digest<M: MattermostApi>(
     client: &M,
     config: &Config,
     now: DateTime<Utc>,
 ) -> Result<DigestResult, AppError> {
     tracing::info!(">>>>>>>>>>>>>>>>>>>Starting digest generation<<<<<<<<<<<<<<<<<<");
+    
+    // Calculate the lower bound timestamp in milliseconds.
     let since = now - Duration::hours(config.mattermost.lookback_hours as i64);
     let since_ms = since.timestamp_millis();
 
     tracing::info!("Authenticating with Mattermost and fetching user info...");
     let _me = client.get_me().await?;
+    
     tracing::info!("Fetching all joined channels...");
     let channels = client.get_my_channels().await?;
+    
     tracing::info!(
         "Found {} channels. Fetching messages from the past {} hours...",
         channels.len(),
@@ -48,6 +56,7 @@ pub async fn generate_digest<M: MattermostApi>(
     for channel in channels {
         pb.set_message(format!("Fetching {}", channel.display_name));
         tracing::debug!("Fetching posts for channel: {}", channel.display_name);
+        
         let mut posts = Vec::new();
         let mut page = 0;
 
@@ -56,9 +65,11 @@ pub async fn generate_digest<M: MattermostApi>(
             let list = client
                 .get_channel_posts(&channel.id, since_ms, page, config.mattermost.per_page)
                 .await?;
+                
             let mut page_posts: Vec<Post> = list
                 .posts
                 .into_values()
+                // Filter out logically deleted posts and ensure they meet the timeframe strictly
                 .filter(|p| p.delete_at == 0 && p.create_at >= since_ms)
                 .collect();
 
@@ -71,6 +82,7 @@ pub async fn generate_digest<M: MattermostApi>(
                 posts.push(p);
             }
 
+            // Break if no posts were returned or if we got fewer than the max per page (end of list)
             if count == 0 || (list.order.len() as u32) < config.mattermost.per_page {
                 break;
             }
@@ -109,7 +121,7 @@ pub async fn generate_digest<M: MattermostApi>(
     );
     let users = client.get_users_by_ids(&user_ids).await.unwrap_or_default();
 
-    // Create a fast lookup map for ID -> User
+    // Create a fast lookup map for ID -> User mapping
     let mut user_map = HashMap::new();
     for u in users {
         user_map.insert(u.id.clone(), u);
@@ -132,6 +144,7 @@ pub async fn generate_digest<M: MattermostApi>(
     })
 }
 
+/// Takes the raw channel payloads and formats them into a structured markdown document.
 fn build_markdown(
     generated_at: DateTime<Utc>,
     lookback_hours: u32,
@@ -157,7 +170,7 @@ fn build_markdown(
         return md;
     }
 
-    // Group by channel
+    // Group posts by channel block
     for (channel, posts) in channel_messages {
         if posts.is_empty() {
             md.push_str(&format!(
@@ -176,6 +189,7 @@ fn build_markdown(
             let day = dt.format("%Y-%m-%d").to_string();
             let time = dt.format("%H:%M").to_string();
 
+            // Insert a subheader for new days in the channel activity
             if day != current_day {
                 md.push_str(&format!("### {}\n", day));
                 current_day = day;
@@ -186,7 +200,7 @@ fn build_markdown(
                 .map(|u| u.username.as_str())
                 .unwrap_or("unknown_user");
 
-            // very simple escaping of newlines for list format
+            // Very simple escaping of newlines for markdown list format
             let cleaned_msg = post.message.replace('\n', "\n  ");
 
             md.push_str(&format!(

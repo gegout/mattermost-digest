@@ -16,6 +16,7 @@ In highly active remote teams, returning from a day off or just waking up to hun
 ## Features
 - 🚀 **Fast & Concurrent:** Written in Rust for maximum performance and low memory footprint.
 - 🤖 **AI Summarization:** Uses Google Gemini to generate a smart, prioritized executive summary.
+- 🧠 **Context & Continuity:** Supports a persistent requester profile (`context.txt`) and an auto-generated rolling memory (`history.txt`) so the AI remembers ongoing topics.
 - 📧 **Gmail Integration:** Sends emails from your own account using OAuth 2.0 (Installed-App flow).
 - 🎨 **HTML Formatting:** Converts Markdown chat logs into a highly readable, styled HTML newsletter.
 - 📊 **Visual Feedback:** Displays a real-time progress bar while fetching messages.
@@ -56,6 +57,29 @@ cp config.example.toml ~/.config/mattermost-digest/config.toml
 ```
 
 Populate it with your Mattermost token, your Gmail secret path, your emails, and your Gemini API key.
+
+---
+
+## Advanced Context & Continuity
+To make the AI summaries highly personalized and maintain continuity across digest runs, `mattermost-digest` supports two powerful text files located in your config directory (`~/.config/mattermost-digest/`):
+
+### 1. `context.txt`
+This file allows you to define who you are and what matters to you. The content of this file is injected directly into the Gemini prompt. 
+- **Example content:**
+  ```text
+  I am Cedric, leading product management for the Antigravity tooling platform. 
+  I prioritize platform stability, new infrastructure integration initiatives, and unblocking QA teams.
+  I don't need to know about standard HR announcements, routine CI pipeline hiccups unless they break main, or lunch plans. Focus on engineering blockers, executive decisions, and active product feature regressions.
+  ```
+
+### 2. `history.txt`
+The application maintains a "rolling history" to provide continuity. 
+- **How it works:** During each run, the app reads `history.txt` (if it exists) to understand ongoing threads from the *previous* run. Before exiting, it automatically makes a lightweight background call to Gemini to generate a *new* compressed continuity readout of the *current* chat logs. This readout replaces `history.txt` on disk, ready for the next cycle.
+- **Benefits:** Gemini remembers that a particular bug was actively being debugged yesterday, allowing it to highlight new developments accurately today instead of treating every digest like a fresh amnesiac session.
+
+Both files are optional. If they are missing, the application will emit a soft warning but will continue to run gracefully.
+
+---
 
 ## Build Instructions
 Build the highly-optimized production version using standard Cargo commands:
@@ -99,9 +123,11 @@ mattermost-digest run
 ```
 This executes the entire workflow:
 1. Fetches all channels and messages from the last 24 hours (or configured window).
-2. Sends the raw logs to Gemini for intelligent summarization.
-3. Compiles the AI summary and raw logs into a styled HTML document.
-4. Uses Gmail OAuth to email the report to your configured inbox.
+2. Reads your `context.txt` and `history.txt` (if available).
+3. Sends the raw logs + context to Gemini for intelligent summarization.
+4. Generates and saves a new `history.txt` for your next run.
+5. Compiles the AI summary and raw logs into a styled HTML document.
+6. Uses Gmail OAuth to email the report to your configured inbox.
 
 ### 5. Override Configuration on the Fly
 You can temporarily override settings in your `config.toml` directly from the CLI:
@@ -113,7 +139,7 @@ Run `mattermost-digest run --help` to see all available override options.
 ---
 
 ## Security Notes
-- **Never commit your `config.toml`**, `client_secret.json`, or `tokencache.json` to version control.
+- **Never commit your `config.toml`**, `client_secret.json`, `context.txt`, `history.txt`, or `tokencache.json` to version control.
 - Restrict permissions on your config files (e.g., `chmod 600 ~/.config/mattermost-digest/config.toml`).
 - Use tokens with the minimal required permissions on Google, Gemini, and Mattermost.
 

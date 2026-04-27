@@ -9,21 +9,31 @@ use crate::config::MattermostConfig;
 use crate::error::AppError;
 use crate::models::{Channel, PostList, User};
 
+/// A trait defining the required interactions with the Mattermost API.
 #[async_trait]
 pub trait MattermostApi {
+    /// Retrieves the profile of the currently authenticated user.
     async fn get_me(&self) -> Result<User, AppError>;
+    /// Retrieves a list of all channels the authenticated user has joined.
     async fn get_my_channels(&self) -> Result<Vec<Channel>, AppError>;
+    /// Fetches a paginated list of posts for a specific channel since a given timestamp.
     async fn get_channel_posts(&self, channel_id: &str, since: i64, page: u32, per_page: u32) -> Result<PostList, AppError>;
+    /// Resolves a list of Mattermost user IDs into full user objects (for rendering display names).
     async fn get_users_by_ids(&self, user_ids: &[String]) -> Result<Vec<User>, AppError>;
 }
 
+/// The concrete HTTP client implementation for the Mattermost API.
 pub struct MattermostClient {
+    /// The underlying asynchronous HTTP client.
     client: Client,
+    /// The base URL of the Mattermost server.
     base_url: String,
+    /// The personal access token used for authentication.
     token: String,
 }
 
 impl MattermostClient {
+    /// Constructs a new `MattermostClient` from the given configuration.
     pub fn new(config: &MattermostConfig) -> Result<Self, AppError> {
         let client = ClientBuilder::new()
             .timeout(Duration::from_secs(config.request_timeout_seconds))
@@ -39,6 +49,7 @@ impl MattermostClient {
         })
     }
 
+    /// Formats the Authorization header for HTTP requests.
     fn auth_header(&self) -> String {
         format!("Bearer {}", self.token)
     }
