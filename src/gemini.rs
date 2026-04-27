@@ -281,6 +281,12 @@ async fn call_gemini_text(config: &Config, prompt: &str) -> Result<String, AppEr
     }
 }
 
+/// Public entry-point for ad-hoc Gemini text generation from modules such as the Telegram bot.
+/// Applies the same primary → fallback model strategy as all other calls.
+pub async fn call_gemini_text_for_bot(config: &Config, prompt: &str) -> Result<String, AppError> {
+    call_gemini_text(config, prompt).await
+}
+
 /// Main entrypoint for custom summarization: generates a summary without modifying history.
 pub async fn summarize_custom_digest(
     config: &Config, 

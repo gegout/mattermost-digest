@@ -3,42 +3,41 @@
 
 use std::collections::HashMap;
 
+/// Top-level commands recognised by the Telegram bot.
 #[derive(Debug, Clone)]
 pub enum Command {
+    /// Returns the current machine resource status with AI log analysis.
     Status,
+    /// Launches the interactive custom digest wizard (with optional overrides).
     Digest,
-    CustomDigest,
-    Cancel,
+    /// Unknown / unrecognised command.
     Unknown(String),
 }
 
+/// Parses the first word of an incoming message into a `Command`.
+/// Leading `/` is stripped automatically.
 pub fn parse_command(text: &str) -> Option<Command> {
-    let mut cmd_str = text;
-    if cmd_str.starts_with('/') {
-        cmd_str = &cmd_str[1..];
-    }
-    
-    let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-    if parts.is_empty() {
-        return None;
-    }
-    
-    match parts[0].to_lowercase().as_str() {
+    let cmd_str = text.trim_start_matches('/');
+    let first = cmd_str.split_whitespace().next()?;
+    match first.to_lowercase().as_str() {
         "status" => Some(Command::Status),
         "digest" => Some(Command::Digest),
-        "customdigest" | "custom" => Some(Command::CustomDigest),
-        "cancel" => Some(Command::Cancel),
-        cmd => Some(Command::Unknown(cmd.to_string())),
+        word => Some(Command::Unknown(word.to_string())),
     }
 }
 
+/// Fields that the user can override during a custom digest session.
 #[derive(Debug, Clone, Default)]
 pub struct DigestOverrides {
+    /// Replacement for the content of `context.txt`.
     pub context: Option<String>,
+    /// Replacement for the content of `history.txt`.
     pub history: Option<String>,
+    /// Override for `mattermost.lookback_hours`.
     pub lookback_hours: Option<u32>,
 }
 
+/// Tracks which step of the multi-step custom digest flow is active.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CustomDigestStep {
     AskContext,
@@ -47,6 +46,7 @@ pub enum CustomDigestStep {
     ReadyToRun,
 }
 
+/// Full state for an in-progress custom digest conversation.
 #[derive(Debug, Clone)]
 pub struct ConversationState {
     pub step: CustomDigestStep,
@@ -54,6 +54,7 @@ pub struct ConversationState {
 }
 
 impl ConversationState {
+    /// Initialises a fresh conversation starting at the context override step.
     pub fn new() -> Self {
         Self {
             step: CustomDigestStep::AskContext,
@@ -62,6 +63,7 @@ impl ConversationState {
     }
 }
 
+/// Holds all active multi-step sessions keyed by Telegram user ID.
 pub struct StateManager {
     pub sessions: HashMap<u64, ConversationState>,
 }

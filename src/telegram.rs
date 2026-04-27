@@ -10,23 +10,27 @@ use crate::config::Config;
 use crate::digest;
 use crate::error::AppError;
 use crate::gemini;
-use crate::gmail;
 use crate::mattermost::MattermostClient;
 use crate::system_status::get_system_status;
-use crate::telegram_commands::{parse_command, Command, ConversationState, CustomDigestStep, DigestOverrides, StateManager};
-use crate::telegram_format::{escape_html, format_error, format_success, format_system_status};
+use crate::telegram_commands::{
+    parse_command, Command, ConversationState, CustomDigestStep, DigestOverrides, StateManager,
+};
+use crate::telegram_format::{escape_html, format_error, format_system_status};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Sends a Telegram message to a specific chat, formatting it with the
-/// parse mode configured for the bot (typically HTML).
+/// Sends a Telegram HTML message to a specific chat.
+/// Long messages are automatically truncated to Telegram's 4 096-character limit.
 async fn send_message(client: &Client, token: &str, chat_id: i64, text: &str, parse_mode: &str) {
     let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    let truncated: String = text.chars().take(4090).collect();
+    let suffix = if text.len() > 4090 { "\n<i>…(truncated)</i>" } else { "" };
+    let body = format!("{}{}", truncated, suffix);
     let payload = json!({
         "chat_id": chat_id,
-        "text": text,
+        "text": body,
         "parse_mode": parse_mode,
     });
     if let Err(e) = client.post(&url).json(&payload).send().await {
@@ -34,20 +38,12 @@ async fn send_message(client: &Client, token: &str, chat_id: i64, text: &str, pa
     }
 }
 
-/// Converts Markdown text to plain HTML using pulldown-cmark (same as the email pipeline).
-fn markdown_to_html(markdown: &str) -> String {
-    let parser = pulldown_cmark::Parser::new(markdown);
-    let mut html = String::new();
-    pulldown_cmark::html::push_html(&mut html, parser);
-    html
-}
 
 // ---------------------------------------------------------------------------
 // Main bot loop
 // ---------------------------------------------------------------------------
 
-/// Starts the long-polling Telegram bot loop. This runs indefinitely and handles
-/// incoming messages, dispatching them to the appropriate command handlers.
+/// Starts the long-polling Telegram bot loop. Runs indefinitely.
 pub async fn run_bot(config: Config) {
     let tconfig = match config.telegram.as_ref() {
         Some(t) => t.clone(),
@@ -71,7 +67,6 @@ pub async fn run_bot(config: Config) {
     );
 
     loop {
-        // getUpdates with long-poll timeout
         let url = format!(
             "https://api.telegram.org/bot{}/getUpdates?offset={}&timeout={}",
             tconfig.bot_token, offset, tconfig.poll_interval_seconds
@@ -82,7 +77,6 @@ pub async fn run_bot(config: Config) {
                 if let Ok(data) = resp.json::<Value>().await {
                     if let Some(updates) = data.get("result").and_then(|r| r.as_array()) {
                         for update in updates {
-                            // Advance the offset so we don't re-process this update.
                             if let Some(id) = update.get("update_id").and_then(|i| i.as_i64()) {
                                 offset = id + 1;
                             }
@@ -127,7 +121,7 @@ async fn handle_message(
         .and_then(|i| i.as_u64())
         .unwrap_or(0);
 
-    // Reject unauthorised users silently.
+    // Silently reject unauthorised users.
     if !tconfig.allowed_user_ids.contains(&user_id) {
         tracing::warn!("Rejected message from unauthorized user_id={}", user_id);
         return;
@@ -141,15 +135,10 @@ async fn handle_message(
     tracing::info!("Received message from user {}: {:?}", user_id, text);
 
     // -----------------------------------------------------------------------
-    // Multi-step custom digest conversation
+    // Multi-step digest conversation (intercepts free-text during a session)
     // -----------------------------------------------------------------------
     if let Some(state) = state_manager.sessions.remove(&user_id) {
-        // Allow cancellation at any step.
-        if matches!(parse_command(text), Some(Command::Cancel)) {
-            send_message(client, &tconfig.bot_token, chat_id, "🚫 <b>Custom digest cancelled.</b>", &tconfig.parse_mode).await;
-            return;
-        }
-        handle_custom_digest_step(client, config, chat_id, user_id, text, state, state_manager).await;
+        handle_digest_step(client, config, chat_id, user_id, text, state, state_manager).await;
         return;
     }
 
@@ -159,56 +148,97 @@ async fn handle_message(
     match parse_command(text) {
         Some(Command::Status) => {
             tracing::info!("Handling /status command for user {}", user_id);
-            let status = get_system_status();
-            send_message(client, &tconfig.bot_token, chat_id, &format_system_status(&status), &tconfig.parse_mode).await;
+            handle_status(client, config, chat_id).await;
         }
 
         Some(Command::Digest) => {
             tracing::info!("Handling /digest command for user {}", user_id);
-            send_message(client, &tconfig.bot_token, chat_id, "⚙️ <b>Generating standard digest…</b> This may take a moment.", &tconfig.parse_mode).await;
-            match run_standard_digest(config).await {
-                Ok(_) => {
-                    send_message(client, &tconfig.bot_token, chat_id, &format_success("Standard digest generated and emailed successfully!"), &tconfig.parse_mode).await;
-                }
-                Err(e) => {
-                    tracing::error!("/digest failed: {}", e);
-                    send_message(client, &tconfig.bot_token, chat_id, &format_error(&e.to_string()), &tconfig.parse_mode).await;
-                }
-            }
-        }
-
-        Some(Command::CustomDigest) => {
-            tracing::info!("Handling /custom command for user {}", user_id);
             state_manager.sessions.insert(user_id, ConversationState::new());
-            let prompt = "🛠 <b>Custom Digest Mode</b>\n\
-                You can override individual inputs. Type <code>skip</code> to keep the default for any step.\n\n\
+            let prompt = "🛠 <b>Digest Mode</b>\n\
+                You can override individual inputs for this run. Type <code>skip</code> to keep the default for any step.\n\n\
                 ✍️ <b>Step 1/3 – Context override</b>\n\
                 Provide custom context text (or <code>skip</code>):";
             send_message(client, &tconfig.bot_token, chat_id, prompt, &tconfig.parse_mode).await;
         }
 
-        Some(Command::Cancel) => {
-            send_message(client, &tconfig.bot_token, chat_id, "ℹ️ No active session to cancel.", &tconfig.parse_mode).await;
-        }
-
         Some(Command::Unknown(_)) | None => {
             let help = "❓ <b>Unknown command.</b>\n\n\
                 Available commands:\n\
-                /status — Machine resource status\n\
-                /digest — Generate and email standard digest\n\
-                /custom — Generate custom digest (with overrides)\n\
-                /cancel — Cancel an active custom digest session";
+                /status — Machine status + AI kernel log analysis\n\
+                /digest — Generate custom digest (with optional overrides)";
             send_message(client, &tconfig.bot_token, chat_id, help, &tconfig.parse_mode).await;
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Custom digest – multi-step state machine
+// /status handler – machine metrics + Gemini kernel log analysis
 // ---------------------------------------------------------------------------
 
-/// Advances a custom digest conversation by one step.
-async fn handle_custom_digest_step(
+/// Collects system metrics and asks Gemini to analyse recent kernel log entries,
+/// then sends both as two separate Telegram messages.
+async fn handle_status(client: &Client, config: &Config, chat_id: i64) {
+    let tconfig = config.telegram.as_ref().unwrap();
+
+    // 1. Collect system metrics (this also fetches kernel logs).
+    tracing::info!("Collecting system status...");
+    let status = get_system_status();
+
+    // 2. Send the metrics snapshot immediately so the user gets fast feedback.
+    send_message(client, &tconfig.bot_token, chat_id, &format_system_status(&status), &tconfig.parse_mode).await;
+
+    // 3. If we have log entries, ask Gemini to analyse them.
+    if status.kernel_log_entries.is_empty() {
+        send_message(client, &tconfig.bot_token, chat_id,
+            "ℹ️ No kernel/journal warning entries found.", &tconfig.parse_mode).await;
+        return;
+    }
+
+    send_message(client, &tconfig.bot_token, chat_id,
+        "🔍 <b>Analysing kernel logs with Gemini…</b>", &tconfig.parse_mode).await;
+
+    let now = Utc::now();
+    let log_block = status.kernel_log_entries.join("\n");
+    let prompt = format!(
+        "You are a Linux system reliability expert.\n\
+         The current date and time is: {}\n\n\
+         The following are the last 20 warning-or-higher messages from journalctl on this machine:\n\
+         <logs>\n{}\n</logs>\n\n\
+         Instructions:\n\
+         - Analyse each log entry. Consider its timestamp relative to the current time.\n\
+         - Entries older than 7 days should be flagged as 'likely resolved' unless they recur.\n\
+         - Identify any entries that are still relevant today (recent or recurring).\n\
+         - Group findings: (1) Critical/Active issues, (2) Warnings worth monitoring, (3) Old/resolved entries.\n\
+         - Be concise. Use plain text without markdown code blocks.\n\
+         - Keep the total response under 1500 characters.\n\
+         - Use emojis to indicate severity: 🔴 critical, 🟡 warning, 🟢 resolved/old.",
+        now.format("%Y-%m-%d %H:%M UTC"),
+        log_block
+    );
+
+    match gemini::call_gemini_text_for_bot(config, &prompt).await {
+        Ok(analysis) => {
+            let msg = format!(
+                "🧠 <b>Gemini Kernel Log Analysis</b>\n\n{}",
+                escape_html(&analysis)
+            );
+            send_message(client, &tconfig.bot_token, chat_id, &msg, &tconfig.parse_mode).await;
+        }
+        Err(e) => {
+            tracing::error!("Gemini kernel log analysis failed: {}", e);
+            send_message(client, &tconfig.bot_token, chat_id,
+                &format!("⚠️ Gemini analysis unavailable: {}", escape_html(&e.to_string())),
+                &tconfig.parse_mode).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /digest – multi-step state machine
+// ---------------------------------------------------------------------------
+
+/// Advances the custom digest conversation by one step.
+async fn handle_digest_step(
     client: &Client,
     config: &Config,
     chat_id: i64,
@@ -218,7 +248,7 @@ async fn handle_custom_digest_step(
     state_manager: &mut StateManager,
 ) {
     let tconfig = config.telegram.as_ref().unwrap();
-    // "skip" means keep the default for this field.
+    // "skip" means keep the application default for this field.
     let input: Option<String> = if text.trim().to_lowercase() == "skip" {
         None
     } else {
@@ -245,7 +275,6 @@ async fn handle_custom_digest_step(
         }
 
         CustomDigestStep::AskLookback => {
-            // Parse the numeric override if provided; reject non-numeric input.
             if let Some(ref val) = input {
                 match val.parse::<u32>() {
                     Ok(hours) => state.overrides.lookback_hours = Some(hours),
@@ -259,15 +288,16 @@ async fn handle_custom_digest_step(
                 }
             }
 
-            // Summarise what will be overridden before running.
-            let mut overrides_description = String::from("📋 <b>Overrides applied:</b>\n");
-            overrides_description.push_str(&format!("• Context: {}\n", state.overrides.context.as_deref().map(|_| "✅ custom").unwrap_or("default")));
-            overrides_description.push_str(&format!("• History: {}\n", state.overrides.history.as_deref().map(|_| "✅ custom").unwrap_or("default")));
-            overrides_description.push_str(&format!("• Lookback hours: {}\n", state.overrides.lookback_hours.map_or("default".to_string(), |h| format!("✅ {}h", h))));
-            overrides_description.push_str("\n⚙️ <b>Generating custom digest…</b>");
-            send_message(client, &tconfig.bot_token, chat_id, &overrides_description, &tconfig.parse_mode).await;
+            // Summarise overrides before running.
+            let mut desc = String::from("📋 <b>Running digest with:</b>\n");
+            desc.push_str(&format!("• Context: {}\n", if state.overrides.context.is_some() { "✅ custom" } else { "default" }));
+            desc.push_str(&format!("• History: {}\n", if state.overrides.history.is_some() { "✅ custom" } else { "default" }));
+            desc.push_str(&format!("• Lookback: {}\n", state.overrides.lookback_hours
+                .map_or("default".to_string(), |h| format!("✅ {}h", h))));
+            desc.push_str("\n⚙️ <b>Generating digest…</b> This may take a moment.");
+            send_message(client, &tconfig.bot_token, chat_id, &desc, &tconfig.parse_mode).await;
 
-            // Clone config and apply lookback override.
+            // Apply lookback override.
             let mut custom_config = config.clone();
             if let Some(h) = state.overrides.lookback_hours {
                 custom_config.mattermost.lookback_hours = h;
@@ -275,18 +305,16 @@ async fn handle_custom_digest_step(
 
             match run_custom_digest(&custom_config, state.overrides).await {
                 Ok(summary) => {
-                    // Trim the summary to Telegram's 4096-char limit.
-                    let truncated: String = summary.chars().take(3900).collect();
                     let msg = format!(
-                        "✅ <b>Custom Digest Summary</b>\n\n{}{}",
-                        escape_html(&truncated),
-                        if summary.len() > 3900 { "\n\n<i>… (truncated)</i>" } else { "" }
+                        "✅ <b>Digest Summary</b>\n\n{}",
+                        escape_html(&summary)
                     );
                     send_message(client, &tconfig.bot_token, chat_id, &msg, &tconfig.parse_mode).await;
                 }
                 Err(e) => {
                     tracing::error!("Custom digest failed: {}", e);
-                    send_message(client, &tconfig.bot_token, chat_id, &format_error(&e.to_string()), &tconfig.parse_mode).await;
+                    send_message(client, &tconfig.bot_token, chat_id,
+                        &format_error(&e.to_string()), &tconfig.parse_mode).await;
                 }
             }
         }
@@ -296,36 +324,11 @@ async fn handle_custom_digest_step(
 }
 
 // ---------------------------------------------------------------------------
-// Digest runners
+// Digest runner
 // ---------------------------------------------------------------------------
 
-/// Runs the standard Mattermost digest pipeline and sends the result by email.
-/// Mirrors the `Commands::Run` logic in `main.rs` without any overrides.
-async fn run_standard_digest(config: &Config) -> Result<(), AppError> {
-    tracing::info!("Standard digest triggered from Telegram bot.");
-    let mm_client = MattermostClient::new(&config.mattermost)?;
-    let now = Utc::now();
-    let result = digest::generate_digest(&mm_client, config, now).await?;
-
-    let mut final_markdown = result.markdown.clone();
-    if result.has_messages {
-        match gemini::summarize_digest(config, &result.markdown).await {
-            Ok(summary) => {
-                final_markdown = format!("# Executive Summary\n\n{}\n\n---\n\n{}", summary, result.markdown);
-            }
-            Err(e) => {
-                tracing::warn!("Gemini summarization failed during bot /digest: {}", e);
-            }
-        }
-    }
-
-    let html = markdown_to_html(&final_markdown);
-    gmail::send_digest_email(&config.gmail, &html).await?;
-    Ok(())
-}
-
 /// Runs the customised Mattermost digest pipeline and returns the raw AI summary text.
-/// Intentionally does NOT send an email and does NOT overwrite `history.txt`.
+/// Does NOT send an email and does NOT overwrite `history.txt`.
 async fn run_custom_digest(config: &Config, overrides: DigestOverrides) -> Result<String, AppError> {
     tracing::info!("Custom digest triggered from Telegram bot.");
     let mm_client = MattermostClient::new(&config.mattermost)?;
