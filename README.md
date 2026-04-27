@@ -132,7 +132,7 @@ This executes the entire workflow:
 ### 5. Override Configuration on the Fly
 You can temporarily override settings in your `config.toml` directly from the CLI:
 ```bash
-mattermost-digest run --lookback-hours 12 --my-username "cgegout" --max-posts-per-channel 100
+mattermost-digest run --lookback-hours 12 --my-username "your name in mattermost" --max-posts-per-channel 100
 ```
 Run `mattermost-digest run --help` to see all available override options.
 
