@@ -1,6 +1,7 @@
 [mattermost]
 base_url = "https://chat.xxx.com"
 personal_token = "INSERT_YOUR_MATTERMOST_PERSONAL_ACCESS_TOKEN_HERE"
+my_username = "YOUR_MATTERMOST_USERNAME"
 lookback_hours = 24
 request_timeout_seconds = 30
 per_page = 200
@@ -11,6 +12,13 @@ token_cache_path = "~/.config/mattermost-digest/tokencache.json"
 from_email = "myaddress@gmail.com"
 to_email = "myaddress@gmail.com"
 email_subject = "Mattermost Digest"
+
+[gemini]
+api_key = "INSERT_YOUR_GEMINI_API_KEY_HERE"
+model = "gemini-2.5-flash"
+fallback_model = "gemini-1.5-flash"
+max_retries = 3
+retry_delay_base_seconds = 2
 
 [output]
 markdown_path = "~/.local/state/mattermost-digest/latest-digest.md"
