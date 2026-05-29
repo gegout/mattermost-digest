@@ -102,12 +102,12 @@ pub async fn generate_digest<M: MattermostApi>(
                 page += 1;
             }
         } else {
-            tracing::info!(
+            /*tracing::info!(
                 "Skipping message fetch for channel '{}' (last post at {}, lookback starts at {})",
                 channel.display_name,
                 channel.last_post_at,
                 since_ms
-            );
+            );*/
         }
 
         // Ensure posts are ordered chronologically for the digest output
