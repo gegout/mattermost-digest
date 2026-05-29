@@ -67,18 +67,25 @@ pub struct GmailConfig {
 pub struct GeminiConfig {
     /// The API key for Gemini.
     pub api_key: String,
-    /// The model string to use for summarization (e.g., gemini-2.5-flash).
-    #[serde(default = "default_gemini_model")]
-    pub model: String,
-    /// The fallback model string to use if the primary model fails.
-    #[serde(default = "default_gemini_fallback_model")]
-    pub fallback_model: String,
     /// Maximum number of retries for API calls.
-    #[serde(default = "default_gemini_max_retries")]
-    pub max_retries: u32,
+    /// Maximum number of different models to try before giving up.
+    #[serde(default = "default_gemini_max_models_to_try")]
+    pub max_models_to_try: u32,
+    /// Maximum number of attempts per model.
+    #[serde(default = "default_gemini_max_attempts_per_model")]
+    pub max_attempts_per_model: u32,
     /// Base delay in seconds for exponential backoff during retries.
     #[serde(default = "default_gemini_retry_delay_base_seconds")]
     pub retry_delay_base_seconds: u32,
+    /// Model name patterns to prefer in order.
+    #[serde(default = "default_preferred_patterns")]
+    pub preferred_model_name_patterns: Vec<String>,
+    /// Model name patterns to exclude.
+    #[serde(default = "default_excluded_patterns")]
+    pub excluded_model_name_patterns: Vec<String>,
+    /// Specific model names to prefer and try first in the given order.
+    #[serde(default = "default_preferred_models")]
+    pub preferred_models: Vec<String>,
 }
 
 /// Settings controlling the markdown output generation.
@@ -140,9 +147,6 @@ fn default_my_username() -> String { "cgegout".to_string() }
 fn default_lookback_hours() -> u32 { 24 }
 fn default_request_timeout_seconds() -> u64 { 30 }
 fn default_per_page() -> u32 { 200 }
-fn default_gemini_model() -> String { "gemini-2.5-flash".to_string() }
-fn default_gemini_fallback_model() -> String { "gemini-1.5-flash".to_string() }
-fn default_gemini_max_retries() -> u32 { 3 }
 fn default_gemini_retry_delay_base_seconds() -> u32 { 2 }
 fn default_email_subject() -> String { "Mattermost Digest".to_string() }
 fn default_false() -> bool { false }
@@ -153,6 +157,27 @@ fn default_telegram_request_timeout() -> u64 { 30 }
 fn default_telegram_parse_mode() -> String { "HTML".to_string() }
 fn default_true() -> bool { true }
 fn default_telegram_confirmation_timeout() -> u64 { 120 }
+fn default_gemini_max_models_to_try() -> u32 { 3 }
+fn default_gemini_max_attempts_per_model() -> u32 { 3 }
+fn default_preferred_patterns() -> Vec<String> {
+    vec!["flash-lite".to_string(), "flash".to_string(), "pro".to_string()]
+}
+fn default_excluded_patterns() -> Vec<String> {
+    vec!["tts".to_string(), "image".to_string(), "live".to_string(), "audio".to_string(), "vision".to_string()]
+}
+fn default_preferred_models() -> Vec<String> {
+    vec![
+        "gemini-3.1-pro-preview".to_string(),
+        "gemini-3.5-flash".to_string(),
+        "gemini-3-flash-preview".to_string(),
+        "gemini-3.1-flash-lite".to_string(),
+        "gemini-2.5-pro".to_string(),
+        "gemini-2.5-flash".to_string(),
+        "gemini-2.5-flash-lite".to_string(),
+        "gemini-2.0-flash".to_string(),
+        "gemini-2.0-flash-lite".to_string(),
+    ]
+}
 
 impl Config {
     /// Loads the configuration from the standardized config path.

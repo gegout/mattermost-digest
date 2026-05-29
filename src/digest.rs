@@ -4,6 +4,7 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::{HashMap, HashSet};
+use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::error::AppError;
@@ -18,11 +19,22 @@ pub struct DigestResult {
     pub has_messages: bool,
 }
 
+/// Carries per-channel progress information during digest fetching.
+pub struct ChannelProgress {
+    /// Index of the channel just completed (1-based).
+    pub current: usize,
+    /// Total number of channels to process.
+    pub total: usize,
+    /// Display name of the channel just fetched.
+    pub channel_name: String,
+}
+
 /// Core application logic that scans Mattermost channels and formats the activity log.
 pub async fn generate_digest<M: MattermostApi>(
     client: &M,
     config: &Config,
     now: DateTime<Utc>,
+    progress_tx: Option<mpsc::Sender<ChannelProgress>>,
 ) -> Result<DigestResult, AppError> {
     tracing::info!(">>>>>>>>>>>>>>>>>>>Starting digest generation<<<<<<<<<<<<<<<<<<");
     
@@ -53,40 +65,49 @@ pub async fn generate_digest<M: MattermostApi>(
         .unwrap()
         .progress_chars("#>-"));
 
-    for channel in channels {
+    for channel in &channels {
         pb.set_message(format!("Fetching {}", channel.display_name));
         tracing::debug!("Fetching posts for channel: {}", channel.display_name);
         
         let mut posts = Vec::new();
-        let mut page = 0;
 
-        // Loop to fetch paginated posts from the channel until we hit the time boundary
-        loop {
-            let list = client
-                .get_channel_posts(&channel.id, since_ms, page, config.mattermost.per_page)
-                .await?;
-                
-            let mut page_posts: Vec<Post> = list
-                .posts
-                .into_values()
-                // Filter out logically deleted posts and ensure they meet the timeframe strictly
-                .filter(|p| p.delete_at == 0 && p.create_at >= since_ms)
-                .collect();
+        if channel.last_post_at >= since_ms {
+            let mut page = 0;
+            // Loop to fetch paginated posts from the channel until we hit the time boundary
+            loop {
+                let list = client
+                    .get_channel_posts(&channel.id, since_ms, page, config.mattermost.per_page)
+                    .await?;
+                    
+                let mut page_posts: Vec<Post> = list
+                    .posts
+                    .into_values()
+                    // Filter out logically deleted posts and ensure they meet the timeframe strictly
+                    .filter(|p| p.delete_at == 0 && p.create_at >= since_ms)
+                    .collect();
 
-            // Sort to ensure we count properly and stop if needed
-            page_posts.sort_by_key(|p| p.create_at);
+                // Sort to ensure we count properly and stop if needed
+                page_posts.sort_by_key(|p| p.create_at);
 
-            let count = page_posts.len();
-            for p in page_posts {
-                user_ids_to_resolve.insert(p.user_id.clone());
-                posts.push(p);
+                let count = page_posts.len();
+                for p in page_posts {
+                    user_ids_to_resolve.insert(p.user_id.clone());
+                    posts.push(p);
+                }
+
+                // Break if no posts were returned or if we got fewer than the max per page (end of list)
+                if count == 0 || (list.order.len() as u32) < config.mattermost.per_page {
+                    break;
+                }
+                page += 1;
             }
-
-            // Break if no posts were returned or if we got fewer than the max per page (end of list)
-            if count == 0 || (list.order.len() as u32) < config.mattermost.per_page {
-                break;
-            }
-            page += 1;
+        } else {
+            tracing::info!(
+                "Skipping message fetch for channel '{}' (last post at {}, lookback starts at {})",
+                channel.display_name,
+                channel.last_post_at,
+                since_ms
+            );
         }
 
         // Ensure posts are ordered chronologically for the digest output
@@ -106,7 +127,16 @@ pub async fn generate_digest<M: MattermostApi>(
         }
 
         if !posts.is_empty() || config.output.include_empty_channels {
-            channel_messages.push((channel, posts));
+            channel_messages.push((channel.clone(), posts));
+        }
+
+        // Report per-channel progress to any subscriber (e.g. Telegram bot).
+        if let Some(ref tx) = progress_tx {
+            let _ = tx.send(ChannelProgress {
+                current: pb.position() as usize + 1,
+                total: channels.len(),
+                channel_name: channel.display_name.clone(),
+            }).await;
         }
         pb.inc(1);
     }

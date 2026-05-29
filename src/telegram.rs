@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use tokio::time::{sleep, Duration};
 
 use crate::config::Config;
-use crate::digest;
+use crate::digest::{self, ChannelProgress};
 use crate::error::AppError;
 use crate::gemini;
 use crate::mattermost::MattermostClient;
@@ -16,28 +16,200 @@ use crate::telegram_commands::{
     parse_command, Command, ConversationState, CustomDigestStep, DigestOverrides, StateManager,
 };
 use crate::telegram_format::{escape_html, format_error, format_system_status};
+use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Pipeline stage definitions
 // ---------------------------------------------------------------------------
+
+/// Labels for each stage of the digest pipeline, in order.
+const STAGES: &[&str] = &[
+    "Connecting to Mattermost",
+    "Fetching messages from channels",
+    "Building digest",
+    "Summarising with Gemini",
+];
+
+/// Builds the full pipeline progress message.
+/// `stage` is the 0-based currently-active stage index.
+/// `sub` is an optional sub-progress bar shown only during the fetch stage.
+fn progress_text(stage: usize, sub: Option<&ChannelProgress>) -> String {
+    let total = STAGES.len();
+    let filled = (stage * 10) / total;
+    let empty = 10 - filled;
+    let bar = format!(
+        "[{}{}] {}/{}",
+        "█".repeat(filled),
+        "░".repeat(empty),
+        stage,
+        total
+    );
+
+    let mut msg = format!("⚙️ <b>Generating Digest…</b>\n\n<code>{}</code>\n\n", bar);
+    for (i, label) in STAGES.iter().enumerate() {
+        let icon = if i < stage {
+            "✅"
+        } else if i == stage {
+            "🔄"
+        } else {
+            "⏳"
+        };
+        msg.push_str(&format!("{} {}\n", icon, label));
+
+        // Inline the channel sub-bar right after the fetch stage label.
+        if i == 1 && i == stage {
+            if let Some(cp) = sub {
+                let ch_filled = (cp.current * 10) / cp.total.max(1);
+                let ch_empty = 10 - ch_filled;
+                let ch_bar = format!(
+                    "   <code>[{}{}] {}/{}</code>",
+                    "▪".repeat(ch_filled),
+                    "▫".repeat(ch_empty),
+                    cp.current,
+                    cp.total,
+                );
+                msg.push_str(&format!("{}\n", ch_bar));
+            }
+        }
+    }
+    msg
+}
+
+/// Builds the final "done" progress message text.
+fn progress_done_text() -> String {
+    let total = STAGES.len();
+    let bar = format!("[{}] {}/{}", "█".repeat(10), total, total);
+    let mut msg = format!("✅ <b>Digest Complete</b>\n\n<code>{}</code>\n\n", bar);
+    for label in STAGES.iter() {
+        msg.push_str(&format!("✅ {}\n", label));
+    }
+    msg
+}
+
+// ---------------------------------------------------------------------------
+// Telegram API helpers
+// ---------------------------------------------------------------------------
+
+/// Sends a Telegram HTML message and returns the `message_id` of the sent message.
+/// Returns `None` on network or parse error.
+async fn send_message_get_id(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+    parse_mode: &str,
+) -> Option<i64> {
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    let truncated: String = text.chars().take(4090).collect();
+    let payload = json!({
+        "chat_id": chat_id,
+        "text": truncated,
+        "parse_mode": parse_mode,
+    });
+    match client.post(&url).json(&payload).send().await {
+        Ok(resp) => resp
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("result")?.get("message_id")?.as_i64()),
+        Err(e) => {
+            tracing::error!("send_message_get_id failed: {}", e);
+            None
+        }
+    }
+}
 
 /// Sends a Telegram HTML message to a specific chat.
 /// Long messages are automatically truncated to Telegram's 4 096-character limit.
 async fn send_message(client: &Client, token: &str, chat_id: i64, text: &str, parse_mode: &str) {
-    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    send_message_get_id(client, token, chat_id, text, parse_mode).await;
+}
+
+/// Edits an existing Telegram message in-place.
+async fn edit_message(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+    parse_mode: &str,
+) {
+    let url = format!("https://api.telegram.org/bot{}/editMessageText", token);
     let truncated: String = text.chars().take(4090).collect();
-    let suffix = if text.len() > 4090 { "\n<i>…(truncated)</i>" } else { "" };
-    let body = format!("{}{}", truncated, suffix);
     let payload = json!({
         "chat_id": chat_id,
-        "text": body,
+        "message_id": message_id,
+        "text": truncated,
         "parse_mode": parse_mode,
     });
     if let Err(e) = client.post(&url).json(&payload).send().await {
-        tracing::error!("Failed to send Telegram message to {}: {}", chat_id, e);
+        tracing::warn!("Failed to edit message {}: {}", message_id, e);
     }
 }
 
+// ---------------------------------------------------------------------------
+// Progress reporter
+// ---------------------------------------------------------------------------
+
+/// Owns the context required to update a live Telegram progress message.
+#[derive(Clone)]
+struct DigestProgress {
+    client: Client,
+    token: String,
+    chat_id: i64,
+    message_id: Option<i64>,
+    parse_mode: String,
+}
+
+impl DigestProgress {
+    /// Updates the live progress message to reflect the given pipeline `stage`.
+    async fn advance(&self, stage: usize) {
+        if let Some(mid) = self.message_id {
+            tracing::info!("Digest progress: stage {}/{}", stage, STAGES.len());
+            edit_message(
+                &self.client,
+                &self.token,
+                self.chat_id,
+                mid,
+                &progress_text(stage, None),
+                &self.parse_mode,
+            )
+            .await;
+        }
+    }
+
+    /// Updates the live progress message to the final "done" state.
+    async fn complete(&self) {
+        if let Some(mid) = self.message_id {
+            edit_message(
+                &self.client,
+                &self.token,
+                self.chat_id,
+                mid,
+                &progress_done_text(),
+                &self.parse_mode,
+            )
+            .await;
+        }
+    }
+
+    /// Appends a status message to the current stage description.
+    async fn status(&self, stage: usize, status: &str) {
+        if let Some(mid) = self.message_id {
+            let mut text = progress_text(stage, None);
+            text.push_str(&format!("\n\n<i>{}</i>", status));
+            edit_message(
+                &self.client,
+                &self.token,
+                self.chat_id,
+                mid,
+                &text,
+                &self.parse_mode,
+            )
+            .await;
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Main bot loop
@@ -134,17 +306,13 @@ async fn handle_message(
 
     tracing::info!("Received message from user {}: {:?}", user_id, text);
 
-    // -----------------------------------------------------------------------
-    // Multi-step digest conversation (intercepts free-text during a session)
-    // -----------------------------------------------------------------------
+    // Multi-step digest conversation (intercepts free-text during a session).
     if let Some(state) = state_manager.sessions.remove(&user_id) {
         handle_digest_step(client, config, chat_id, user_id, text, state, state_manager).await;
         return;
     }
 
-    // -----------------------------------------------------------------------
-    // Top-level command dispatch
-    // -----------------------------------------------------------------------
+    // Top-level command dispatch.
     match parse_command(text) {
         Some(Command::Status) => {
             tracing::info!("Handling /status command for user {}", user_id);
@@ -175,63 +343,90 @@ async fn handle_message(
 // /status handler – machine metrics + Gemini kernel log analysis
 // ---------------------------------------------------------------------------
 
-/// Collects system metrics and asks Gemini to analyse recent kernel log entries,
-/// then sends both as two separate Telegram messages.
 async fn handle_status(client: &Client, config: &Config, chat_id: i64) {
     let tconfig = config.telegram.as_ref().unwrap();
 
-    // 1. Collect system metrics (this also fetches kernel logs).
+    // Send an immediate loading message so the user knows we are working.
+    let status_msg_id = send_message_get_id(
+        client, &tconfig.bot_token, chat_id,
+        "⏳ <b>Collecting system metrics…</b>", &tconfig.parse_mode
+    ).await;
+
     tracing::info!("Collecting system status...");
     let status = get_system_status();
 
-    // 2. Send the metrics snapshot immediately so the user gets fast feedback.
-    send_message(client, &tconfig.bot_token, chat_id, &format_system_status(&status), &tconfig.parse_mode).await;
+    // Update the loading message with the rich metrics snapshot.
+    if let Some(mid) = status_msg_id {
+        edit_message(
+            client, &tconfig.bot_token, chat_id, mid,
+            &format_system_status(&status), &tconfig.parse_mode
+        ).await;
+    } else {
+        send_message(client, &tconfig.bot_token, chat_id, &format_system_status(&status), &tconfig.parse_mode).await;
+    }
 
-    // 3. If we have log entries, ask Gemini to analyse them.
-    if status.kernel_log_entries.is_empty() {
-        send_message(client, &tconfig.bot_token, chat_id,
-            "ℹ️ No kernel/journal warning entries found.", &tconfig.parse_mode).await;
+    // If there are no log signals and the system is Healthy, skip Gemini entirely.
+    if status.log_signals.is_empty() && status.health == crate::system_status::HealthStatus::Healthy {
+        tracing::info!("System is healthy with no log signals — skipping Gemini analysis.");
         return;
     }
 
+    // Otherwise, ask Gemini to comment on the health picture and any log signals.
     send_message(client, &tconfig.bot_token, chat_id,
-        "🔍 <b>Analysing kernel logs with Gemini…</b>", &tconfig.parse_mode).await;
+        "🧠 <b>Analysing system health with Gemini…</b>", &tconfig.parse_mode).await;
 
     let now = Utc::now();
-    let log_block = status.kernel_log_entries.join("\n");
+    let log_block = if status.log_signals.is_empty() {
+        "No log signals collected.".to_string()
+    } else {
+        status.log_signals.join("\n")
+    };
+
     let prompt = format!(
         "You are a Linux system reliability expert.\n\
-         The current date and time is: {}\n\n\
-         The following are the last 20 warning-or-higher messages from journalctl on this machine:\n\
-         <logs>\n{}\n</logs>\n\n\
+         Current date/time: {}\n\n\
+         Machine snapshot:\n\
+         - CPU: {:.1}%  Load: {:.2} / {:.2} / {:.2}  ({} CPUs)\n\
+         - Memory: {} MB / {} MB used\n\
+         - Disk /: {} GB / {} GB used\n\
+         - Uptime: {}s\n\
+         - Overall health assessment: {}\n\
+         - Findings: {}\n\n\
+         Log signals (best-effort, may be empty):\n<logs>\n{}\n</logs>\n\n\
          Instructions:\n\
-         - Analyse each log entry. Consider its timestamp relative to the current time.\n\
-         - Entries older than 7 days should be flagged as 'likely resolved' unless they recur.\n\
-         - Identify any entries that are still relevant today (recent or recurring).\n\
-         - Group findings: (1) Critical/Active issues, (2) Warnings worth monitoring, (3) Old/resolved entries.\n\
-         - Be concise. Use plain text without markdown code blocks.\n\
+         - Review the machine snapshot and any log signals.\n\
+         - Flag entries older than 7 days as likely resolved unless recurring.\n\
+         - Group findings: (1) Active/Critical, (2) Worth monitoring, (3) Resolved/old.\n\
+         - After the analysis, provide exactly 3 Recommended Approaches to improve machine health or stability.\n\
+         - Use ONLY Telegram-compatible HTML tags for formatting (<b>, <i>, <code>).\n\
+         - DO NOT use markdown symbols like **, *, or ###.\n\
          - Keep the total response under 1500 characters.\n\
-         - Use emojis to indicate severity: 🔴 critical, 🟡 warning, 🟢 resolved/old.",
+         - Use emojis: 🔴 critical, 🟡 warning, 🟢 resolved/healthy.",
         now.format("%Y-%m-%d %H:%M UTC"),
-        log_block
+        status.cpu_usage, status.load_1m, status.load_5m, status.load_15m, status.cpu_count,
+        status.memory_used_mb, status.memory_total_mb,
+        status.disk_used_gb, status.disk_total_gb,
+        status.uptime_seconds,
+        status.health.label(),
+        status.findings.join("; "),
+        log_block,
     );
 
     match gemini::call_gemini_text_for_bot(config, &prompt).await {
         Ok(analysis) => {
-            let msg = format!(
-                "🧠 <b>Gemini Kernel Log Analysis</b>\n\n{}",
-                escape_html(&analysis)
-            );
+            // Note: We don't escape_html here because we asked Gemini to provide valid HTML tags.
+            let msg = format!("🧠 <b>Gemini Health Analysis</b>\n\n{}", analysis);
             send_message(client, &tconfig.bot_token, chat_id, &msg, &tconfig.parse_mode).await;
         }
         Err(e) => {
-            tracing::error!("Gemini kernel log analysis failed: {}", e);
+            tracing::error!("Gemini health analysis failed: {}", e);
             send_message(client, &tconfig.bot_token, chat_id,
                 &format!("⚠️ Gemini analysis unavailable: {}", escape_html(&e.to_string())),
                 &tconfig.parse_mode).await;
         }
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // /digest – multi-step state machine
@@ -248,7 +443,6 @@ async fn handle_digest_step(
     state_manager: &mut StateManager,
 ) {
     let tconfig = config.telegram.as_ref().unwrap();
-    // "skip" means keep the application default for this field.
     let input: Option<String> = if text.trim().to_lowercase() == "skip" {
         None
     } else {
@@ -279,7 +473,7 @@ async fn handle_digest_step(
                 match val.parse::<u32>() {
                     Ok(hours) => state.overrides.lookback_hours = Some(hours),
                     Err(_) => {
-                        let msg = "❌ Expected an integer for lookback hours. Please try again (or type <code>skip</code>):";
+                        let msg = "❌ Expected an integer for lookback hours. Try again (or type <code>skip</code>):";
                         send_message(client, &tconfig.bot_token, chat_id, msg, &tconfig.parse_mode).await;
                         state.step = CustomDigestStep::AskLookback;
                         state_manager.sessions.insert(user_id, state);
@@ -288,14 +482,28 @@ async fn handle_digest_step(
                 }
             }
 
-            // Summarise overrides before running.
+            // Summarise what will be overridden.
             let mut desc = String::from("📋 <b>Running digest with:</b>\n");
             desc.push_str(&format!("• Context: {}\n", if state.overrides.context.is_some() { "✅ custom" } else { "default" }));
             desc.push_str(&format!("• History: {}\n", if state.overrides.history.is_some() { "✅ custom" } else { "default" }));
-            desc.push_str(&format!("• Lookback: {}\n", state.overrides.lookback_hours
+            desc.push_str(&format!("• Lookback: {}\n\n", state.overrides.lookback_hours
                 .map_or("default".to_string(), |h| format!("✅ {}h", h))));
-            desc.push_str("\n⚙️ <b>Generating digest…</b> This may take a moment.");
-            send_message(client, &tconfig.bot_token, chat_id, &desc, &tconfig.parse_mode).await;
+            // Append the initial progress bar (stage 0) to the same message.
+            desc.push_str(&progress_text(0, None));
+
+            // Send the combined config summary + initial progress bar, capture the message_id.
+            let progress_msg_id = send_message_get_id(
+                client, &tconfig.bot_token, chat_id, &desc, &tconfig.parse_mode
+            ).await;
+
+            // Build the progress reporter.
+            let progress = DigestProgress {
+                client: client.clone(),
+                token: tconfig.bot_token.clone(),
+                chat_id,
+                message_id: progress_msg_id,
+                parse_mode: tconfig.parse_mode.clone(),
+            };
 
             // Apply lookback override.
             let mut custom_config = config.clone();
@@ -303,18 +511,23 @@ async fn handle_digest_step(
                 custom_config.mattermost.lookback_hours = h;
             }
 
-            match run_custom_digest(&custom_config, state.overrides).await {
+            match run_custom_digest(&custom_config, state.overrides, &progress).await {
                 Ok(summary) => {
-                    let msg = format!(
-                        "✅ <b>Digest Summary</b>\n\n{}",
-                        escape_html(&summary)
-                    );
+                    progress.complete().await;
+                    // Note: We don't escape_html here because we asked Gemini for valid HTML.
+                    let msg = format!("📝 <b>Digest Summary</b>\n\n{}", summary);
                     send_message(client, &tconfig.bot_token, chat_id, &msg, &tconfig.parse_mode).await;
                 }
                 Err(e) => {
                     tracing::error!("Custom digest failed: {}", e);
-                    send_message(client, &tconfig.bot_token, chat_id,
-                        &format_error(&e.to_string()), &tconfig.parse_mode).await;
+                    // Replace the progress bar with an error.
+                    if let Some(mid) = progress.message_id {
+                        edit_message(client, &tconfig.bot_token, chat_id, mid,
+                            &format_error(&e.to_string()), &tconfig.parse_mode).await;
+                    } else {
+                        send_message(client, &tconfig.bot_token, chat_id,
+                            &format_error(&e.to_string()), &tconfig.parse_mode).await;
+                    }
                 }
             }
         }
@@ -327,20 +540,95 @@ async fn handle_digest_step(
 // Digest runner
 // ---------------------------------------------------------------------------
 
-/// Runs the customised Mattermost digest pipeline and returns the raw AI summary text.
+/// Runs the customised Mattermost digest pipeline, reporting progress at each stage.
 /// Does NOT send an email and does NOT overwrite `history.txt`.
-async fn run_custom_digest(config: &Config, overrides: DigestOverrides) -> Result<String, AppError> {
+async fn run_custom_digest(
+    config: &Config,
+    overrides: DigestOverrides,
+    progress: &DigestProgress,
+) -> Result<String, AppError> {
     tracing::info!("Custom digest triggered from Telegram bot.");
+
+    // Stage 0 → 1: connecting to Mattermost.
+    progress.advance(0).await;
     let mm_client = MattermostClient::new(&config.mattermost)?;
     let now = Utc::now();
-    let result = digest::generate_digest(&mm_client, config, now).await?;
+
+    // Stage 1: fetching messages — spawn a task that listens for per-channel
+    // progress and edits the Telegram message with a sub-bar, rate-limited
+    // to at most one edit per second to stay within Telegram API limits.
+    progress.advance(1).await;
+
+    let (channel_tx, mut channel_rx) = mpsc::channel::<ChannelProgress>(64);
+
+    // Clone everything the listener task needs.
+    let listener_client  = progress.client.clone();
+    let listener_token   = progress.token.clone();
+    let listener_chat_id = progress.chat_id;
+    let listener_msg_id  = progress.message_id;
+    let listener_mode    = progress.parse_mode.clone();
+
+    let listener = tokio::spawn(async move {
+        use std::time::Instant;
+        let mut last_edit = Instant::now() - std::time::Duration::from_secs(2);
+        while let Some(cp) = channel_rx.recv().await {
+            tracing::debug!(
+                "Channel progress: {}/{} – {}",
+                cp.current, cp.total, cp.channel_name
+            );
+            // Rate-limit: edit at most once per second.
+            if last_edit.elapsed() >= std::time::Duration::from_millis(1000)
+                || cp.current == cp.total
+            {
+                if let Some(mid) = listener_msg_id {
+                    let text = progress_text(1, Some(&cp));
+                    edit_message(
+                        &listener_client,
+                        &listener_token,
+                        listener_chat_id,
+                        mid,
+                        &text,
+                        &listener_mode,
+                    )
+                    .await;
+                    last_edit = Instant::now();
+                }
+            }
+        }
+    });
+
+    // Run the digest; the channel sender is dropped when generate_digest returns,
+    // which signals the listener task to finish.
+    let result = digest::generate_digest(&mm_client, config, now, Some(channel_tx)).await?;
+
+    // Wait for the listener to finish its last edit before we advance stages.
+    let _ = listener.await;
+
+    // Stage 2: digest built, handing to Gemini.
+    progress.advance(2).await;
+
+    // Stage 3: summarising with Gemini.
+    progress.advance(3).await;
+
+    let (gemini_tx, mut gemini_rx) = mpsc::channel::<String>(10);
+    let gemini_listener_progress = progress.clone();
+    let gemini_listener = tokio::spawn(async move {
+        while let Some(status) = gemini_rx.recv().await {
+            gemini_listener_progress.status(3, &status).await;
+        }
+    });
 
     let summary = gemini::summarize_custom_digest(
         config,
         &result.markdown,
         overrides.context,
         overrides.history,
-    ).await?;
+        true, // use_html
+        Some(gemini_tx),
+    )
+    .await?;
+
+    let _ = gemini_listener.await;
 
     Ok(summary)
 }

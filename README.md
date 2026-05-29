@@ -19,7 +19,9 @@ In highly active remote teams, returning from a day off or just waking up to hun
 - 🧠 **Context & Continuity:** Supports a persistent requester profile (`context.txt`) and an auto-generated rolling memory (`history.txt`) so the AI remembers ongoing topics.
 - 📧 **Gmail Integration:** Sends emails from your own account using OAuth 2.0 (Installed-App flow).
 - 🎨 **HTML Formatting:** Converts Markdown chat logs into a highly readable, styled HTML newsletter.
-- 📊 **Visual Feedback:** Displays a real-time progress bar while fetching messages.
+- 📊 **Visual Feedback:** Real-time progress bars and sub-bars for channel-level granularity in the CLI and Telegram bot.
+- 🤖 **Telegram Bot Mode:** Interact with the digest engine and monitor your machine's health via a secure Telegram interface.
+- 🔄 **Dynamic Model Fallback:** Automatically discovers and switches to alternate Gemini models if the primary model is unavailable or unsupported.
 - ⚙️ **Flexible CLI:** Easily override default configurations directly from the command line.
 
 ---
@@ -81,6 +83,40 @@ Both files are optional. If they are missing, the application will emit a soft w
 
 ---
 
+## 🤖 Telegram Bot Interface
+
+The application includes a fully interactive Telegram bot mode (`bot` command). This allows you to trigger digests and monitor your machine remotely.
+
+### Commands
+- `/status`: Generates a rich machine health report (CPU, RAM, Disk, Load, Uptime, Top Processes).
+  - 🧠 Includes an **AI Health Analysis**: Gemini scans best-effort log signals (syslog, kern.log, crash logs) to identify active issues or warnings.
+  - 🔒 **Non-privileged**: Designed to run as a normal user; fallback mechanisms handle restricted log access gracefully.
+- `/digest`: Launches a multi-step interactive wizard to run a custom digest.
+  - 🛠️ Allows overriding **Context**, **History**, and **Lookback Hours** for a single run.
+  - 📈 Provides a **live progress bar** with per-channel updates.
+
+### Bot Configuration
+Ensure your `config.toml` contains the `[telegram]` section with your bot token and authorized user IDs:
+```toml
+[telegram]
+bot_token = "your_bot_token"
+allowed_user_ids = [123456789]  # Restrict access to your own IDs
+```
+
+## 🔄 Dynamic Gemini Fallback
+
+To ensure maximum reliability, `mattermost-digest` features an advanced dynamic fallback mechanism for the Gemini AI. 
+
+- **Initial Attempt:** The app always starts with your configured primary model.
+- **Intelligent Retries:** If a model fails with a transient error (503 Unavailable, 429 Rate Limit), it retries up to 3 times with exponential backoff.
+- **Dynamic Discovery:** If the primary model is exhausted, unsupported, or non-existent, the app calls the Gemini API to discover currently available models.
+- **Smart Selection:** Discovered models are ranked based on their capabilities (must support `generateContent`) and tier (preferring `flash-lite`, `flash`, and `pro` variants).
+- **Execution Limit:** The app will try at most 3 different models before returning a comprehensive failure report.
+
+This mechanism ensures that your digest is delivered even if specific Gemini models are under heavy load or have been deprecated.
+
+---
+
 ## Build Instructions
 Build the highly-optimized production version using standard Cargo commands:
 ```bash
@@ -111,13 +147,19 @@ mattermost-digest auth gmail
 ```
 This will open your default web browser. Follow the prompts to authenticate with your Google account. It will securely store the OAuth token cache in `~/.config/mattermost-digest/tokencache.json`. Future runs will use this cached token silently.
 
-### 3. Dry-Run Digest
+### 3. Run as a Telegram Bot
+```bash
+mattermost-digest bot
+```
+This starts the bot in long-polling mode. You can now chat with your bot on Telegram.
+
+### 4. Dry-Run Digest (CLI)
 ```bash
 mattermost-digest run --dry-run
 ```
 This will fetch all new messages and generate the markdown and HTML digest, but it will **exit without sending the email**. This is great for testing your configuration locally.
 
-### 4. Run the Full Pipeline
+### 5. Run the Full Pipeline (CLI)
 ```bash
 mattermost-digest run
 ```
@@ -129,7 +171,7 @@ This executes the entire workflow:
 5. Compiles the AI summary and raw logs into a styled HTML document.
 6. Uses Gmail OAuth to email the report to your configured inbox.
 
-### 5. Override Configuration on the Fly
+### 6. Override Configuration on the Fly (CLI)
 You can temporarily override settings in your `config.toml` directly from the CLI:
 ```bash
 mattermost-digest run --lookback-hours 12 --my-username "your name in mattermost" --max-posts-per-channel 100
@@ -151,3 +193,23 @@ The application intentionally uses only a strictly read-only subset of the Matte
 - `POST /api/v4/users/ids` (To resolve author user IDs)
 
 **To satisfy the strict constraint that the tool must not mark any messages as read or viewed**, view-marking endpoints under channel views and unread-state retrievals are intentionally **never called**.
+
+---
+
+## Release History
+
+### 0.6.0 (2026-04-29)
+- **Dynamic Gemini Fallback:** Implemented real-time model discovery via the Gemini API to handle rate limits and model deprecations.
+- **Improved Error Classification:** Added intelligent retry logic and model-switching based on HTTP error categories.
+- **Live Fallback UX:** Added Telegram bot progress updates when switching to fallback models.
+- **Unit Testing:** Added robust testing for Gemini model ranking and error categorization.
+
+### 0.5.0 (2026-04-27)
+- **Telegram Bot Mode:** Introduced long-polling bot for interactive digests and system health monitoring.
+- **System Status Command:** Non-privileged `/status` command for real-time machine health insights.
+- **Enhanced Progress Indicators:** Smooth progress bars in both CLI and Telegram interfaces.
+
+### 0.4.0 (2026-04-23)
+- **History Management:** Added `history.txt` to track context between digest runs and avoid redundant summaries.
+- **Improved HTML Templates:** Significant aesthetic upgrades to the emailed reports.
+

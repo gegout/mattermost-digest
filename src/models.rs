@@ -33,6 +33,9 @@ pub struct Channel {
     /// The type of channel ('O' for public, 'P' for private, 'D' for direct, 'G' for group).
     #[serde(rename = "type")]
     pub channel_type: String,
+    /// The timestamp (in milliseconds) when the last post was made in this channel.
+    #[serde(default)]
+    pub last_post_at: i64,
 }
 
 /// Represents a paginated response of posts from the Mattermost API.

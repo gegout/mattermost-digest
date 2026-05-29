@@ -15,10 +15,21 @@ email_subject = "Mattermost Digest"
 
 [gemini]
 api_key = "INSERT_YOUR_GEMINI_API_KEY_HERE"
-model = "gemini-2.5-flash"
-fallback_model = "gemini-1.5-flash"
-max_retries = 3
-retry_delay_base_seconds = 2
+retry_delay_base_seconds = 20
+max_models_to_try = 5                       # Try up to 3 different models
+max_attempts_per_model = 3                  # Attempts per model
+preferred_models = [
+  "gemini-3.1-pro-preview",
+  "gemini-3.5-flash",
+  "gemini-3-flash-preview",
+  "gemini-3.1-flash-lite",
+  "gemini-2.5-pro",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash",
+  "gemini-2.0-flash-lite"
+]
+
 
 [output]
 markdown_path = "~/.local/state/mattermost-digest/latest-digest.md"
@@ -38,4 +49,3 @@ parse_mode = "HTML"
 [telegram.reboot]
 require_confirmation = true
 confirmation_timeout_seconds = 120
-

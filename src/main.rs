@@ -6,6 +6,7 @@ pub mod config;
 pub mod digest;
 pub mod error;
 pub mod gemini;
+pub mod gemini_model_ranking;
 pub mod gmail;
 pub mod mattermost;
 pub mod models;
@@ -92,7 +93,7 @@ async fn run() -> Result<(), AppError> {
             // Initialize Mattermost API client and fetch the latest messages
             let mm_client = MattermostClient::new(&config.mattermost)?;
             let now = Utc::now();
-            let result = digest::generate_digest(&mm_client, &config, now).await?;
+            let result = digest::generate_digest(&mm_client, &config, now, None).await?;
             
             let md_path = config::expand_tilde(&config.output.markdown_path);
             
